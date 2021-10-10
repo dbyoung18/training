@@ -1,0 +1,14 @@
+# saving models
+**/models/*
+# pretrained model
+**/*.pth
+# tensorboard
+**/tensorboard/*
+# python cache
+**/__pycache__/*
+# log
+**/*.log
+# profile trace
+**/*.json
+# verbose log
+**/*.csv

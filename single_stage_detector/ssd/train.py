@@ -7,6 +7,7 @@ from ssd300 import SSD300
 import torch
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import time
 import random
 import numpy as np
@@ -16,6 +17,11 @@ from mlperf_logger import ssd_print, broadcast_seeds
 from mlperf_logger import mllogger
 
 _BASE_LR=2.5e-3
+
+device = torch.device('cpu')
+precision = torch.float32
+iter_writer = None
+epoch_writer = None
 
 def parse_args():
     parser = ArgumentParser(description="Train Single Shot MultiBox Detector"
@@ -27,12 +33,10 @@ def parse_args():
                              'default is to get it from online torchvision repository')
     parser.add_argument('--epochs', '-e', type=int, default=800,
                         help='number of epochs for training')
-    parser.add_argument('--batch-size', '-b', type=int, default=32,
+    parser.add_argument('--batch-size', '-b', type=int, default=128,
                         help='number of examples for each training iteration')
-    parser.add_argument('--val-batch-size', type=int, default=None,
+    parser.add_argument('--val-batch-size', type=int, default=128,
                         help='number of examples for each validation iteration (defaults to --batch-size)')
-    parser.add_argument('--no-cuda', action='store_true',
-                        help='use available GPUs')
     parser.add_argument('--seed', '-s', type=int, default=random.SystemRandom().randint(0, 2**32 - 1),
                         help='manually set random seed for torch')
     parser.add_argument('--threshold', '-t', type=float, default=0.23,
@@ -69,6 +73,21 @@ def parse_args():
                              'than nms_valid_thresh.')
     parser.add_argument('--log-interval', type=int, default=100,
                         help='Logging mini-batch interval.')
+    parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+                        help='number of data loading workers (default: 4)')
+    parser.add_argument('--precision', default='fp32', choices=['fp32', 'fp16', 'bf16'])
+    parser.add_argument('--device', default='cpu', choices=['cpu', 'xpu', 'cuda'])
+    parser.add_argument('--tb-iter', default=0, type=int,
+                        help='draw Tensorboard per X iterations')
+    parser.add_argument('--tb-epoch', default=0, type=int,
+                        help='draw Tensorboard per X epochs')
+    parser.add_argument('--warmup-iter', type=int, default=0,
+                        help='warmup model with dummy data for X iterations')
+    parser.add_argument('--prof-iter', type=int, default=0,
+                        help='profile model for X iterations')
+    parser.add_argument('--benchmark-iter', type=int, default=0,
+                        help='measure throughput with X iterations')
+
     # Distributed stuff
     parser.add_argument('--local_rank', default=os.getenv('LOCAL_RANK', 0), type=int,
                         help='Used for multi-process training. Can either be manually set '
@@ -76,6 +95,28 @@ def parse_args():
 
     return parser.parse_args()
 
+def trace_handler(prof, trace_path=None):
+    print(prof.key_averages().table(sort_by="self_xpu_time_total", row_limit=100))
+    print("--------------------")
+    if device == torch.device('cuda'):
+        print(prof.table(sort_by="id", row_limit=10000000))
+    elif device == torch.device('xpu'):
+        print(prof.table(sort_by="id", max_depth=10, row_limit=10000000))
+    if trace_path:
+        prof.export_chrome_trace(trace_path)
+
+def tensorboard_handler(loss, acc, duration, lr, idx, fine='iteration'):
+    if fine == 'epoch':
+        writer = epoch_writer
+        writer.add_scalar('epoch_learning_rate', lr, idx)
+        writer.add_scalar('epoch_loss', loss, idx)
+        if acc:
+            writer.add_scalar('epoch_accuracy', acc, idx)
+        writer.add_scalar('epoch_duration', duration, idx)
+    if fine == 'iteration':
+        writer = iter_writer
+        writer.add_scalar('iteration_loss', loss, idx)
+        writer.add_scalar('iteration_duration', duration, idx)
 
 def show_memusage(device=0):
     import gpustat
@@ -101,8 +142,6 @@ def coco_eval(model, val_dataloader, cocoGt, encoder, inv_map, threshold,
     from pycocotools.cocoeval import COCOeval
     print("")
     model.eval()
-    if use_cuda:
-        model.cuda()
     ret = []
 
     overlap_threshold = 0.50
@@ -116,10 +155,8 @@ def coco_eval(model, val_dataloader, cocoGt, encoder, inv_map, threshold,
     start = time.time()
     for nbatch, (img, img_id, img_size, bbox, label) in enumerate(val_dataloader):
         with torch.no_grad():
-            if use_cuda:
-                img = img.cuda()
+            img = img.to(device, precision)
             ploc, plabel = model(img)
-
             try:
                 results = encoder.decode_batch(ploc, plabel,
                                                overlap_threshold,
@@ -157,7 +194,7 @@ def coco_eval(model, val_dataloader, cocoGt, encoder, inv_map, threshold,
     E.evaluate()
     E.accumulate()
     E.summarize()
-    print("Current AP: {:.5f} AP goal: {:.5f}".format(E.stats[0], threshold))
+    print("Epoch {:2d}, Current AP: {:.5f} AP goal: {:.5f}".format(epoch, E.stats[0], threshold))
 
     # put your model back into training mode
     model.train()
@@ -171,7 +208,7 @@ def coco_eval(model, val_dataloader, cocoGt, encoder, inv_map, threshold,
     mllogger.end(
         key=mllog_const.EVAL_STOP,
         metadata={mllog_const.EPOCH_NUM: epoch})
-    return current_accuracy >= threshold #Average Precision  (AP) @[ IoU=050:0.95 | area=   all | maxDets=100 ]
+    return current_accuracy # Average precision  (AP) @[ IoU=050:0.95 | area=   all | maxDets=100 ]
 
 def lr_warmup(optim, wb, iter_num, base_lr, args):
 	if iter_num < wb:
@@ -182,13 +219,84 @@ def lr_warmup(optim, wb, iter_num, base_lr, args):
 		for param_group in optim.param_groups:
 			param_group['lr'] = new_lr
 
+def model_warmup(args, ssd300, loss_func, optim, fragment_size):
+    warmup_start = time.time()
+    # generate dummy data
+    current_batch_size = args.batch_size
+    img = torch.rand([args.batch_size, 3, 300, 300])
+    bbox = torch.rand([args.batch_size, 8732, 4])
+    label = torch.rand([args.batch_size, 8732]).to(device)
+
+    current_fragment_size = img.shape[0]
+
+    for i in range(args.warmup_iter):
+        print('==> start warmup iter {0}'.format(i))
+        fimg = Variable(img, requires_grad=True).to(device, precision)
+        fbbox = bbox.to(device, precision)
+        flabel = label.to(device, torch.int64)
+        ploc, plabel = ssd300(fimg)
+
+        trans_bbox = fbbox.transpose(1,2).contiguous()
+        gloc = Variable(trans_bbox, requires_grad=False)
+        glabel = Variable(flabel, requires_grad=False)
+        loss = loss_func(ploc, plabel, gloc, glabel)
+        loss = loss * (current_fragment_size / current_batch_size) # weighted mean
+        loss = loss.to(device, precision)
+        loss.backward()
+
+        optim.step()
+        optim.zero_grad()
+    warmup_dur = time.time() - warmup_start
+    print('Model warmup done, warmup {} iterations, cost {:.3f}s'.format(args.warmup_iter, warmup_dur))
+
+def model_profile(args, ssd300, loss_func, optim, fragment_size, train_dataloader):
+    from torch.autograd.profiler import profile
+    prof_start = time.time()
+    for nbatch, (img, img_id, img_size, bbox, label) in enumerate(train_dataloader):
+        current_batch_size = img.shape[0]
+        # Split batch for gradient accumulation
+        img = torch.split(img, fragment_size)
+        bbox = torch.split(bbox, fragment_size)
+        label = torch.split(label, fragment_size)
+
+        for (fimg, fbbox, flabel) in zip(img, bbox, label):
+            if device == torch.device('cuda'):
+                with profile(use_cuda=True, record_shapes=True) as prof:
+                    ssd300_single_iter(ssd300, loss_func, optim, fimg, fbbox, flabel, current_batch_size)
+            elif device == torch.device('xpu'):
+                with profile(enabled=True, use_xpu=True, record_shapes=True) as prof:
+                    ssd300_single_iter(ssd300, loss_func, optim, fimg, fbbox, flabel, current_batch_size)
+        if nbatch == args.prof_iter:
+            break
+
+    # trace_path = './ssd-rn34_{0}_{1}_bs{2}_timeline.json'.format(args.device, args.precision, args.batch_size)
+    trace_handler(prof)
+    prof_dur = time.time() - prof_start
+    print('Model profiling done, profile {} iterations, cost {:.3f}s'.format(args.prof_iter, prof_dur))
+
+def ssd300_single_iter(ssd300, loss_func, optim, fimg, fbbox, flabel, current_batch_size):
+    current_fragment_size = fimg.shape[0]
+    fimg = Variable(fimg, requires_grad=False).to(device, precision)
+    fbbox = fbbox.to(device, precision)
+    flabel = flabel.to(device)
+    ploc, plabel = ssd300(fimg)
+
+    trans_bbox = fbbox.transpose(1,2).contiguous()
+    gloc = Variable(trans_bbox, requires_grad=False)
+    glabel = Variable(flabel, requires_grad=False)
+    loss = loss_func(ploc, plabel, gloc, glabel)
+    loss = loss * (current_fragment_size / current_batch_size) # weighted mean
+    loss = loss.to(device, precision)
+    loss.backward()
+    optim.step()
+    optim.zero_grad(set_to_none=True)
+
 def train300_mlperf_coco(args):
     global torch
     from coco import COCO
     # Check that GPUs are actually available
-    use_cuda = not args.no_cuda and torch.cuda.is_available()
     args.distributed = False
-    if use_cuda:
+    if args.device == 'cuda' and torch.cuda.is_available():
         try:
             from apex.parallel import DistributedDataParallel as DDP
             if 'WORLD_SIZE' in os.environ:
@@ -201,16 +309,14 @@ def train300_mlperf_coco(args):
         # necessary pytorch imports
         import torch.utils.data.distributed
         import torch.distributed as dist
-        if args.no_cuda:
-            device = torch.device('cpu')
-        else:
+        if args.device == 'cuda':
             torch.cuda.set_device(args.local_rank)
-            device = torch.device('cuda')
             dist.init_process_group(backend='nccl',
                                     init_method='env://')
             # set seeds properly
             args.seed = broadcast_seeds(args.seed, device)
             local_seed = (args.seed + dist.get_rank()) % 2**32
+
     mllogger.event(key=mllog_const.SEED, value=local_seed)
     torch.manual_seed(local_seed)
     np.random.seed(seed=local_seed)
@@ -219,6 +325,7 @@ def train300_mlperf_coco(args):
     print("args.rank = {}".format(args.rank))
     print("local rank = {}".format(args.local_rank))
     print("distributed={}".format(args.distributed))
+    print("using device = {}".format(args.device))
 
     dboxes = dboxes300_coco()
     encoder = Encoder(dboxes)
@@ -247,14 +354,14 @@ def train300_mlperf_coco(args):
                                   batch_size=args.batch_size,
                                   shuffle=(train_sampler is None),
                                   sampler=train_sampler,
-                                  num_workers=4)
+                                  num_workers=args.workers)
     # set shuffle=True in DataLoader
     if args.rank==0:
         val_dataloader = DataLoader(val_coco,
                                     batch_size=args.val_batch_size or args.batch_size,
                                     shuffle=False,
                                     sampler=None,
-                                    num_workers=4)
+                                    num_workers=args.workers)
     else:
         val_dataloader = None
 
@@ -264,11 +371,13 @@ def train300_mlperf_coco(args):
         od = torch.load(args.checkpoint)
         ssd300.load_state_dict(od["model"])
     ssd300.train()
-    if use_cuda:
-        ssd300.cuda()
-    loss_func = Loss(dboxes)
-    if use_cuda:
-        loss_func.cuda()
+    ssd300.to(device, precision)
+    loss_func = Loss(dboxes).to(device)
+    if precision == torch.bfloat16:
+        loss_func.bfloat16()
+    elif precision == torch.half:
+        loss_func.half()
+
     if args.distributed:
         N_gpu = torch.distributed.get_world_size()
     else:
@@ -281,7 +390,7 @@ def train300_mlperf_coco(args):
     global_batch_size = N_gpu * args.batch_size
     mllogger.event(key=mllog_const.GLOBAL_BATCH_SIZE, value=global_batch_size)
     # Reference doesn't support group batch norm, so bn_span==local_batch_size
-    mllogger.event(key=mllog_const.MODEL_BN_SPAN, value=args.batch_size)
+    mllogger.event(key=mllog_const.MODEL_BN_SPAN, value=args.batch_size//args.batch_splits)
     current_lr = args.lr * (global_batch_size / 32)
 
     assert args.batch_size % args.batch_splits == 0, "--batch-size must be divisible by --batch-splits"
@@ -290,19 +399,22 @@ def train300_mlperf_coco(args):
         print("using gradient accumulation with fragments of size {}".format(fragment_size))
 
     current_momentum = 0.9
-    optim = torch.optim.SGD(ssd300.parameters(), lr=current_lr,
-                            momentum=current_momentum,
-                            weight_decay=args.weight_decay)
+
+    if args.precision == 'bf16' and args.device == 'xpu':
+        optim = ipex.optim.SGDMasterWeight(ssd300.parameters(), lr=current_lr,
+                                           momentum=current_momentum,
+                                           weight_decay=args.weight_decay)
+    else:
+        optim = torch.optim.SGD(ssd300.parameters(), lr=current_lr,
+                                momentum=current_momentum,
+                                weight_decay=args.weight_decay)
     ssd_print(key=mllog_const.OPT_BASE_LR, value=current_lr)
     ssd_print(key=mllog_const.OPT_WEIGHT_DECAY, value=args.weight_decay)
 
     iter_num = args.iteration
     avg_loss = 0.0
     inv_map = {v:k for k,v in val_coco.label_map.items()}
-    success = torch.zeros(1)
-    if use_cuda:
-        success = success.cuda()
-
+    success = torch.zeros(1).to(device)
 
     if args.warmup:
         nonempty_imgs = len(train_coco)
@@ -319,8 +431,24 @@ def train300_mlperf_coco(args):
         metadata={mllog_const.FIRST_EPOCH_NUM: 1,
                   mllog_const.EPOCH_COUNT: args.epochs})
 
-    optim.zero_grad()
+    optim.zero_grad(set_to_none=True)
+
+    if args.warmup_iter > 0:
+        print('==> start model warmup')
+        model_warmup(args, ssd300, loss_func, optim, fragment_size)
+
+    if args.prof_iter > 0:
+        print('==> start model profiling')
+        model_profile(args, ssd300, loss_func, optim, fragment_size, train_dataloader)
+
+    print('==> start model training')
+    if args.rank == 0:
+        train_start = time.time()
+        print("==> trainning start at " + str(train_start))
+
     for epoch in range(args.epochs):
+        epoch_start = time.time()
+        print("==> epoch " + str(epoch) + " start at " + str(epoch_start))
         mllogger.start(
             key=mllog_const.EPOCH_START,
             metadata={mllog_const.EPOCH_NUM: epoch})
@@ -336,6 +464,8 @@ def train300_mlperf_coco(args):
                 param_group['lr'] = current_lr
 
         for nbatch, (img, img_id, img_size, bbox, label) in enumerate(train_dataloader):
+            if args.rank == 0:
+               iter_start = time.time()
             current_batch_size = img.shape[0]
             # Split batch for gradient accumulation
             img = torch.split(img, fragment_size)
@@ -344,29 +474,46 @@ def train300_mlperf_coco(args):
 
             for (fimg, fbbox, flabel) in zip(img, bbox, label):
                 current_fragment_size = fimg.shape[0]
-                trans_bbox = fbbox.transpose(1,2).contiguous()
-                if use_cuda:
-                    fimg = fimg.cuda()
-                    trans_bbox = trans_bbox.cuda()
-                    flabel = flabel.cuda()
-                fimg = Variable(fimg, requires_grad=True)
+                fimg = Variable(fimg, requires_grad=True).to(device, precision)
+                fbbox = fbbox.to(device, precision)
+                flabel = flabel.to(device)
                 ploc, plabel = ssd300(fimg)
-                gloc, glabel = Variable(trans_bbox, requires_grad=False), \
-                               Variable(flabel, requires_grad=False)
+
+                trans_bbox = fbbox.transpose(1,2).contiguous()
+                gloc = Variable(trans_bbox, requires_grad=False)
+                glabel = Variable(flabel, requires_grad=False)
                 loss = loss_func(ploc, plabel, gloc, glabel)
-                loss = loss * (current_fragment_size / current_batch_size) # weighted mean
+                #loss = loss * (current_fragment_size / current_batch_size) # weighted mean
+                loss = loss.to(device, precision)
                 loss.backward()
+
+            for param in ssd300.parameters():
+                param.grad *= (current_fragment_size / current_batch_size)
 
             warmup_step(iter_num, current_lr)
             optim.step()
             optim.zero_grad()
+
+            if args.rank == 0:
+                iter_dur = time.time() - iter_start
+                if args.benchmark_iter > 0:
+                    #print("==> epoch " + str(epoch) + " batch " + str(nbatch) + " latency : " + str(iter_dur))
+                    train_dur = time.time() - train_start
+                    print("==> timestamp = " + str(time.time()) + " iteration " + str(iter_num) + " throughput = " + str((iter_num + 1) * global_batch_size / train_dur))
+                    if (iter_num + 1) >= args.benchmark_iter:
+                        return False
+
             if not np.isinf(loss.item()): avg_loss = 0.999*avg_loss + 0.001*loss.item()
-            if args.rank == 0 and args.log_interval and not iter_num % args.log_interval:
-                print("Iteration: {:6d}, Loss function: {:5.3f}, Average Loss: {:.3f}"\
-                    .format(iter_num, loss.item(), avg_loss))
+            if args.rank == 0:
+                if args.log_interval and not iter_num % args.log_interval:
+                    print("({},{}) Iteration: {}, Loss function: {:5.3f}, Average Loss: {:.3f}"\
+                    .format(epoch, nbatch, iter_num, loss.item(), avg_loss))
+                if args.tb_iter:
+                    tensorboard_handler(loss.to(device, precision).item(),
+                                        None, iter_dur, current_lr, iter_num, 'iteration')
             iter_num += 1
 
-
+        acc = None
         if (args.val_epochs and (epoch+1) in args.val_epochs) or \
            (args.val_interval and not (epoch+1) % args.val_interval):
             if args.distributed:
@@ -382,22 +529,27 @@ def train300_mlperf_coco(args):
                     print("")
                     print("saving model...")
                     torch.save({"model" : ssd300.state_dict(), "label_map": train_coco.label_info},
-                               "./models/iter_{}.pt".format(iter_num))
-
-                if coco_eval(ssd300, val_dataloader, cocoGt, encoder, inv_map,
-                             args.threshold, epoch + 1, iter_num,
-                             log_interval=args.log_interval,
-                             nms_valid_thresh=args.nms_valid_thresh):
-                    success = torch.ones(1)
-                    if use_cuda:
-                        success = success.cuda()
+                               "./models/ssd-rn34_{0}_{1}_bs{2}_epoch{3}.pt" \
+                               .format(args.device, args.precision, args.batch_size, epoch))
+                acc = coco_eval(ssd300, val_dataloader, cocoGt, encoder, inv_map,
+                                args.threshold, epoch + 1, iter_num,
+                                log_interval=args.log_interval,
+                                use_cuda = False,
+                                nms_valid_thresh=args.nms_valid_thresh)
+                if acc >= args.threshold:
+                    success = torch.ones(1).to(device)
             if args.distributed:
                 dist.broadcast(success, 0)
             if success[0]:
-                    return True
+                return True
             mllogger.end(
                 key=mllog_const.EPOCH_STOP,
                 metadata={mllog_const.EPOCH_NUM: epoch})
+
+        epoch_dur = time.time() - epoch_start
+        if args.rank == 0 and args.tb_epoch > 0 and (epoch+1) % args.tb_epoch == 0:
+            tensorboard_handler(avg_loss, acc, epoch_dur, current_lr, epoch, 'epoch')
+
     mllogger.end(
         key=mllog_const.BLOCK_STOP,
         metadata={mllog_const.FIRST_EPOCH_NUM: 1,
@@ -408,6 +560,26 @@ def train300_mlperf_coco(args):
 def main():
     mllogger.start(key=mllog_const.INIT_START)
     args = parse_args()
+    print('==> args:', args)
+
+    global device
+    device = torch.device(args.device)
+
+    if args.precision != 'fp32':
+        global precision
+        if args.precision == 'fp16':
+            precision = torch.half
+        elif args.precision == 'bf16':
+            precision = torch.bfloat16
+
+    if args.tb_iter != 0:
+        global iter_writer
+        iter_writer = SummaryWriter(log_dir='./tensorboard/ssd-rn34_{0}_{1}_bs{2}_iter' \
+                                    .format(args.device, args.precision, args.batch_size))
+    if args.tb_epoch != 0:
+        global epoch_writer
+        epoch_writer = SummaryWriter(log_dir='./tensorboard/ssd-rn34_{0}_{1}_bs{2}_epoch' \
+                                     .format(args.device, args.precision, args.batch_size))
 
     if args.local_rank == 0:
         if not os.path.isdir('./models'):
