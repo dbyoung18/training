@@ -20,8 +20,7 @@ _BASE_LR=2.5e-3
 
 device = torch.device('cpu')
 precision = torch.float32
-iter_writer = None
-epoch_writer = None
+tb_writer = None
 
 def parse_args():
     parser = ArgumentParser(description="Train Single Shot MultiBox Detector"
@@ -107,16 +106,15 @@ def trace_handler(prof, trace_path=None):
 
 def tensorboard_handler(loss, acc, duration, lr, idx, fine='iteration'):
     if fine == 'epoch':
-        writer = epoch_writer
-        writer.add_scalar('epoch_learning_rate', lr, idx)
-        writer.add_scalar('epoch_loss', loss, idx)
-        if acc:
-            writer.add_scalar('epoch_accuracy', acc, idx)
-        writer.add_scalar('epoch_duration', duration, idx)
-    if fine == 'iteration':
-        writer = iter_writer
-        writer.add_scalar('iteration_loss', loss, idx)
-        writer.add_scalar('iteration_duration', duration, idx)
+        tb_writer.add_scalar('epoch_learning_rate', lr, idx)
+        tb_writer.add_scalar('epoch_loss', loss, idx)
+        tb_writer.add_scalar('epoch_duration', duration, idx)
+    elif fine == 'iteration':
+        tb_writer.add_scalar('iteration_loss', loss, idx)
+        tb_writer.add_scalar('iteration_duration', duration, idx)
+    elif fine == 'val':
+        tb_writer.add_scalar('epoch_accuracy', acc, idx)
+        tb_writer.add_scalar('evaluation_duration:', duration, idx)
 
 def show_memusage(device=0):
     import gpustat
@@ -211,13 +209,13 @@ def coco_eval(model, val_dataloader, cocoGt, encoder, inv_map, threshold,
     return current_accuracy # Average precision  (AP) @[ IoU=050:0.95 | area=   all | maxDets=100 ]
 
 def lr_warmup(optim, wb, iter_num, base_lr, args):
-	if iter_num < wb:
-		# mlperf warmup rule
-		warmup_step = base_lr / (wb * (2 ** args.warmup_factor))
-		new_lr = base_lr - (wb - iter_num) * warmup_step
+    if iter_num < wb:
+        # mlperf warmup rule
+        warmup_step = base_lr / (wb * (2 ** args.warmup_factor))
+        new_lr = base_lr - (wb - iter_num) * warmup_step
 
-		for param_group in optim.param_groups:
-			param_group['lr'] = new_lr
+        for param_group in optim.param_groups:
+            param_group['lr'] = new_lr
 
 def model_warmup(args, ssd300, loss_func, optim, fragment_size):
     warmup_start = time.time()
@@ -240,7 +238,6 @@ def model_warmup(args, ssd300, loss_func, optim, fragment_size):
         gloc = Variable(trans_bbox, requires_grad=False)
         glabel = Variable(flabel, requires_grad=False)
         loss = loss_func(ploc, plabel, gloc, glabel)
-        loss = loss * (current_fragment_size / current_batch_size) # weighted mean
         loss = loss.to(device, precision)
         loss.backward()
 
@@ -285,7 +282,6 @@ def ssd300_single_iter(ssd300, loss_func, optim, fimg, fbbox, flabel, current_ba
     gloc = Variable(trans_bbox, requires_grad=False)
     glabel = Variable(flabel, requires_grad=False)
     loss = loss_func(ploc, plabel, gloc, glabel)
-    loss = loss * (current_fragment_size / current_batch_size) # weighted mean
     loss = loss.to(device, precision)
     loss.backward()
     optim.step()
@@ -350,15 +346,30 @@ def train300_mlperf_coco(args):
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_coco)
     else:
         train_sampler = None
+
+    if args.distributed:
+        N_gpu = torch.distributed.get_world_size()
+    else:
+        N_gpu = 1
+
+    global_batch_size = N_gpu * args.batch_size
+    assert args.batch_size % args.batch_splits == 0, "--batch-size must be divisible by --batch-splits"
+    local_batch_size = args.batch_size // args.batch_splits
+
+    if args.tb_iter != 0 or args.tb_epoch != 0:
+        global tb_writer
+        tb_writer = SummaryWriter(log_dir='./tensorboard/ssd-rn34_{0}_{1}_bs{2}_{3}x{4}' \
+                                  .format(args.device, args.precision, global_batch_size, N_gpu, args.batch_splits))
+
     train_dataloader = DataLoader(train_coco,
-                                  batch_size=args.batch_size,
+                                  batch_size=local_batch_size,
                                   shuffle=(train_sampler is None),
                                   sampler=train_sampler,
                                   num_workers=args.workers)
     # set shuffle=True in DataLoader
     if args.rank==0:
         val_dataloader = DataLoader(val_coco,
-                                    batch_size=args.val_batch_size or args.batch_size,
+                                    batch_size=args.val_batch_size or local_batch_size,
                                     shuffle=False,
                                     sampler=None,
                                     num_workers=args.workers)
@@ -378,25 +389,17 @@ def train300_mlperf_coco(args):
     elif precision == torch.half:
         loss_func.half()
 
-    if args.distributed:
-        N_gpu = torch.distributed.get_world_size()
-    else:
-        N_gpu = 1
-
-	# parallelize
+    # parallelize
     if args.distributed:
         ssd300 = DDP(ssd300)
 
-    global_batch_size = N_gpu * args.batch_size
     mllogger.event(key=mllog_const.GLOBAL_BATCH_SIZE, value=global_batch_size)
     # Reference doesn't support group batch norm, so bn_span==local_batch_size
-    mllogger.event(key=mllog_const.MODEL_BN_SPAN, value=args.batch_size//args.batch_splits)
+    mllogger.event(key=mllog_const.MODEL_BN_SPAN, value=local_batch_size)
     current_lr = args.lr * (global_batch_size / 32)
 
-    assert args.batch_size % args.batch_splits == 0, "--batch-size must be divisible by --batch-splits"
-    fragment_size = args.batch_size // args.batch_splits
     if args.batch_splits != 1:
-        print("using gradient accumulation with fragments of size {}".format(fragment_size))
+        print("using gradient accumulation with local batch_size {}".format(local_batch_size))
 
     current_momentum = 0.9
 
@@ -463,36 +466,34 @@ def train300_mlperf_coco(args):
             for param_group in optim.param_groups:
                 param_group['lr'] = current_lr
 
+        counter = 0
         for nbatch, (img, img_id, img_size, bbox, label) in enumerate(train_dataloader):
             if args.rank == 0:
                iter_start = time.time()
-            current_batch_size = img.shape[0]
-            # Split batch for gradient accumulation
-            img = torch.split(img, fragment_size)
-            bbox = torch.split(bbox, fragment_size)
-            label = torch.split(label, fragment_size)
 
-            for (fimg, fbbox, flabel) in zip(img, bbox, label):
-                current_fragment_size = fimg.shape[0]
-                fimg = Variable(fimg, requires_grad=True).to(device, precision)
-                fbbox = fbbox.to(device, precision)
-                flabel = flabel.to(device)
-                ploc, plabel = ssd300(fimg)
+            img = Variable(img, requires_grad=False).to(device, precision)
+            bbox = bbox.to(device, precision)
+            label = label.to(device)
+            ploc, plabel = ssd300(img)
 
-                trans_bbox = fbbox.transpose(1,2).contiguous()
-                gloc = Variable(trans_bbox, requires_grad=False)
-                glabel = Variable(flabel, requires_grad=False)
-                loss = loss_func(ploc, plabel, gloc, glabel)
-                #loss = loss * (current_fragment_size / current_batch_size) # weighted mean
-                loss = loss.to(device, precision)
-                loss.backward()
+            trans_bbox = bbox.transpose(1,2).contiguous()
+            gloc = Variable(trans_bbox, requires_grad=False)
+            glabel = Variable(label, requires_grad=False)
+            loss = loss_func(ploc, plabel, gloc, glabel)
+            loss = loss.to(device, precision)
+            loss.backward()
 
-            for param in ssd300.parameters():
-                param.grad *= (current_fragment_size / current_batch_size)
+            counter += 1
 
-            warmup_step(iter_num, current_lr)
-            optim.step()
-            optim.zero_grad()
+            if counter % args.batch_splits == 0 or img.shape[0] < local_batch_size:
+                for param in ssd300.parameters():
+                    param.grad /= counter
+                warmup_step(iter_num, current_lr)
+                optim.step()
+                optim.zero_grad()
+                counter = 0
+            else:
+                continue
 
             if args.rank == 0:
                 iter_dur = time.time() - iter_start
@@ -513,7 +514,11 @@ def train300_mlperf_coco(args):
                                         None, iter_dur, current_lr, iter_num, 'iteration')
             iter_num += 1
 
-        acc = None
+        epoch_dur = time.time() - epoch_start
+
+        if args.rank == 0 and args.tb_epoch > 0 and (epoch + 1) % args.tb_epoch == 0:
+            tensorboard_handler(avg_loss, None, epoch_dur, current_lr, epoch, 'epoch')
+
         if (args.val_epochs and (epoch+1) in args.val_epochs) or \
            (args.val_interval and not (epoch+1) % args.val_interval):
             if args.distributed:
@@ -522,17 +527,16 @@ def train300_mlperf_coco(args):
                     if ('running_mean' in bn_name) or ('running_var' in bn_name):
                         dist.all_reduce(bn_buf, op=dist.ReduceOp.SUM)
                         bn_buf /= world_size
-                        ssd_print(key=mllog_const.MODEL_BN_SPAN,
-                            value=bn_buf)
             if args.rank == 0:
                 if not args.no_save:
                     print("")
                     print("saving model...")
                     torch.save({"model" : ssd300.state_dict(), "label_map": train_coco.label_info},
-                               "./models/ssd-rn34_{0}_{1}_bs{2}_epoch{3}.pt" \
-                               .format(args.device, args.precision, args.batch_size, epoch))
+                               "./models/ssd-rn34_{0}_{1}_bs{2}_{3}x{4}_epoch{5}.pt" \
+                               .format(args.device, args.precision, global_batch_size, N_gpu, args.batch_splits, epoch))
+                val_start = time.time()
                 acc = coco_eval(ssd300, val_dataloader, cocoGt, encoder, inv_map,
-                                args.threshold, epoch + 1, iter_num,
+                                args.threshold, epoch+1, iter_num,
                                 log_interval=args.log_interval,
                                 use_cuda = False,
                                 nms_valid_thresh=args.nms_valid_thresh)
@@ -540,15 +544,14 @@ def train300_mlperf_coco(args):
                     success = torch.ones(1).to(device)
             if args.distributed:
                 dist.broadcast(success, 0)
-            if success[0]:
+            if args.rank == 0 and args.tb_epoch > 0 and (epoch + 1) % args.tb_epoch == 0:
+                val_dur = time.time() - val_start
+                tensorboard_handler(None, acc, val_dur, None, epoch, 'val')
+            if success[0] and (epoch + 1) % 5 == 0:
                 return True
             mllogger.end(
                 key=mllog_const.EPOCH_STOP,
                 metadata={mllog_const.EPOCH_NUM: epoch})
-
-        epoch_dur = time.time() - epoch_start
-        if args.rank == 0 and args.tb_epoch > 0 and (epoch+1) % args.tb_epoch == 0:
-            tensorboard_handler(avg_loss, acc, epoch_dur, current_lr, epoch, 'epoch')
 
     mllogger.end(
         key=mllog_const.BLOCK_STOP,
@@ -571,15 +574,6 @@ def main():
             precision = torch.half
         elif args.precision == 'bf16':
             precision = torch.bfloat16
-
-    if args.tb_iter != 0:
-        global iter_writer
-        iter_writer = SummaryWriter(log_dir='./tensorboard/ssd-rn34_{0}_{1}_bs{2}_iter' \
-                                    .format(args.device, args.precision, args.batch_size))
-    if args.tb_epoch != 0:
-        global epoch_writer
-        epoch_writer = SummaryWriter(log_dir='./tensorboard/ssd-rn34_{0}_{1}_bs{2}_epoch' \
-                                     .format(args.device, args.precision, args.batch_size))
 
     if args.local_rank == 0:
         if not os.path.isdir('./models'):

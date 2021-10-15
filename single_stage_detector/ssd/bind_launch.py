@@ -23,11 +23,17 @@ def parse_args():
     parser.add_argument("--node_rank", type=int, default=0,
                         help="The rank of the node for multi-node distributed "
                              "training")
+    parser.add_argument("--gpu_rank", type=int, default=0,
+                        help="The rank of the gpu for multi-gpu distributed training")
+    parser.add_argument("--ngpu_per_node", type=int, default=1,
+                        help="The number of gpus on each node")
     parser.add_argument("--nproc_per_node", type=int, default=1,
                         help="The number of processes to launch on each node, "
                              "for GPU training, this is recommended to be set "
                              "to the number of GPUs in your system so that "
                              "each process can be bound to a single GPU.")
+    parser.add_argument("--ncore_per_proc", type=int, default=None,
+                        help="The number of cpu cores to bind to each process")
     parser.add_argument("--master_addr", default="127.0.0.1", type=str,
                         help="Master node (rank 0)'s address, should be either "
                              "the IP address or the hostname of node 0, for "
@@ -64,8 +70,9 @@ def main():
 
     # variables for numactrl binding
     NSOCKETS = args.nsockets_per_node
-    NGPUS_PER_SOCKET = args.nproc_per_node // args.nsockets_per_node
-    NCORES_PER_GPU = args.ncores_per_socket // NGPUS_PER_SOCKET
+    NGPUS_PER_SOCKET = args.ngpu_per_node // NSOCKETS
+    #NGPUS_PER_SOCKET = args.nproc_per_node // args.nsockets_per_node
+    NCORES_PER_GPU = args.ncore_per_proc or args.ncores_per_socket // NGPUS_PER_SOCKET
 
     # world size in terms of number of processes
     dist_world_size = args.nproc_per_node * args.nnodes
@@ -78,7 +85,7 @@ def main():
 
     processes = []
 
-    for local_rank in range(0, args.nproc_per_node):
+    for local_rank in range(args.gpu_rank, args.gpu_rank+args.nproc_per_node):
         # each process's rank
         dist_rank = args.nproc_per_node * args.node_rank + local_rank
         current_env["RANK"] = str(dist_rank)
@@ -86,8 +93,8 @@ def main():
         # form numactrl binding command
         cpu_ranges = [local_rank * NCORES_PER_GPU,
                      (local_rank + 1) * NCORES_PER_GPU - 1,
-                     local_rank * NCORES_PER_GPU + (NCORES_PER_GPU * NGPUS_PER_SOCKET * NSOCKETS),
-                     (local_rank + 1) * NCORES_PER_GPU + (NCORES_PER_GPU * NGPUS_PER_SOCKET * NSOCKETS) - 1]
+                     local_rank * NCORES_PER_GPU + (args.ncores_per_socket * NSOCKETS),
+                     (local_rank + 1) * NCORES_PER_GPU + (args.ncores_per_socket * NSOCKETS) - 1]
 
         numactlargs = []
         if args.no_hyperthreads:
@@ -108,7 +115,7 @@ def main():
                 "--local_rank={}".format(local_rank)
               ] \
             + args.training_script_args
-
+        print('==> cmd:', " ".join(cmd[:]))
         process = subprocess.Popen(cmd, env=current_env)
         processes.append(process)
 

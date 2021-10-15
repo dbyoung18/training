@@ -14,17 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-source ./config_bs1024_2x4.sh
+if [[ ${DATASET_DIR} == '' ]]; then
+  echo 'Warning: Please export DATASET_DIR=<path-to-dataset> first!'
+  return 78
+fi
 
-SLURM_NTASKS_PER_NODE=${SLURM_NTASKS_PER_NODE:-$DGXNGPU}
-SLURM_JOB_ID=${SLURM_JOB_ID:-$RANDOM}
-echo "Run vars: id $SLURM_JOB_ID gpus $SLURM_NTASKS_PER_NODE mparams $MULTI_NODE"
-
-# runs benchmark and reports time to convergence
-# to use the script:
-#   run_and_time.sh
+if [[ ${MODEL_DIR} == '' ]]; then
+  echo 'Warning: Please export MODEL_DIR=<path-to-backbone-model> first!'
+  return 78
+fi
 
 set -e
+
+# config hp and run vars
+#source ./config_bs1024_1x8.sh  # 1 Tile / 1 GPU
+source ./config_bs1024_2x4.sh  # 2 Tile / 2 GPU
 
 # start timing
 start=$(date +%s)
@@ -34,33 +38,28 @@ echo "STARTING TIMING RUN AT $start_fmt"
 # run benchmark
 set -x
 NUMEPOCHS=${NUMEPOCHS:-70}
-LR=${LR:-"2.5e-3"}
 
 echo "running benchmark"
 
-if [[ ${DATASET_DIR} == '' ]]; then
-  echo 'Warning: Please export DATASET_DIR=<path-to-dataset> first!'
-  return 78
-fi
-
-python -m bind_launch --nsockets_per_node ${DGXNSOCKET} \
-                      --ncores_per_socket ${DGXSOCKETCORES} \
-                      --nproc_per_node $SLURM_NTASKS_PER_NODE $MULTI_NODE \
+python -u bind_launch.py \
+  --nsockets_per_node ${NUM_SOCKET_PER_NODE} \
+  --ncores_per_socket ${NUM_CORE_PER_SOCKET} \
+  --ngpu_per_node ${NUM_GPU_PER_NODE} \
+  --nproc_per_node ${USE_GPU} \
+  --ncore_per_proc ${USE_CORE_PER_PROC} \
  train.py \
   --epochs "${NUMEPOCHS}" \
-  --warmup-factor 0 \
-  --lr "${LR}" \
   --threshold=0.23 \
   --data ${DATASET_DIR} \
   --device cuda \
-  --precision fp32 \
-  --pretrained-backbone resnet34-333f7ec4.pth \
+  --precision fp16 \
+  --pretrained-backbone ${MODEL_DIR} \
   --val-interval 5 \
+  --val-epochs 46 47 48 49 \
   --log-interval 1 \
-  --tb-epoch 5 \
+  --tb-epoch 1 \
   --tb-iter 100 \
-  --seed 2000 \
-  --batch-splits 4 \
+  --workers 8 \
   ${EXTRA_PARAMS[@]} ; ret_code=$?
 
 set +x
@@ -77,4 +76,4 @@ echo "ENDING TIMING RUN AT $end_fmt"
 result=$(( $end - $start ))
 result_name="OBJECT_DETECTION"
 
-echo "RESULT,$result_name,,$result,nvidia,$start_fmt"
+echo "RESULT,$result_name,,$result,intel,$start_fmt"

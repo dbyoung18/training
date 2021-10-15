@@ -1,9 +1,15 @@
 #!/bin/bash
 
+set -x
 ## DL params
 EXTRA_PARAMS=(
                --batch-size      "1024"
-               --warmup          "2.619685" # 300 iterations * 8 GPUs * 1 nodes * 128 batch size / 117266 non-empty images
+               --batch-splits    "8"
+               --weight-decay    "0.00013"
+               --lr              "0.003157"
+               --warmup          "5"
+               --warmup-factor   "0"
+	       --lr-decay-schedule "44 55"
              )
 
 ## System run parms
@@ -13,7 +19,7 @@ WALLTIME=12:00:00
 
 ## System config params
 DGXNGPU=2
-DGXSOCKETCORES=8
+DGXSOCKETCORES=16
 DGXNSOCKET=1
-DGXHT=1         # HT is on is 2, HT off is 1
-DGXIBDEVICES=''
+DGXHT=2 	# HT is on is 2, HT off is 1
+set +x
