@@ -19,7 +19,8 @@ DATA_DIR=$1
 CHECKPOINT_DIR=$2
 RESULT_DIR=$3
 
-docker run -it --rm \
+docker run -it -d --rm \
+  --name="rnnt-test" \
   --gpus='all' \
   --shm-size=4g \
   --ulimit memlock=-1 \

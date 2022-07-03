@@ -21,11 +21,11 @@ export OMP_NUM_THREADS=1
 : ${OUTPUT_DIR:=${3:-"/results"}}
 : ${CHECKPOINT:=${4:-}}
 : ${CUDNN_BENCHMARK:=true}
-: ${NUM_GPUS:=8}
+: ${NUM_GPUS:=1}
 : ${AMP:=false}
-: ${GLOBAL_BATCH_SIZE:=1024}
+: ${GLOBAL_BATCH_SIZE:=128}
 : ${VAL_BATCH_SIZE:=2}
-: ${GRAD_ACCUMULATION_STEPS:=8}
+: ${GRAD_ACCUMULATION_STEPS:=64}
 : ${LEARNING_RATE:=0.004}
 : ${LR_EXP_GAMMA:=0.935}  # ~0.005 in 80 epochs
 : ${NUM_BUCKETS=6} # empty means to use torch.utils.data.distributed.DistributedSampler
@@ -43,9 +43,7 @@ export OMP_NUM_THREADS=1
 : ${BETA1:=0.9}
 : ${BETA2:=0.999}
 : ${LOG_FREQUENCY:=1}
-: ${TRAIN_MANIFESTS:="$DATA_DIR/librispeech-train-clean-100-wav.json \
-                      $DATA_DIR/librispeech-train-clean-360-wav.json \
-                      $DATA_DIR/librispeech-train-other-500-wav.json"}
+: ${TRAIN_MANIFESTS:="$DATA_DIR/librispeech-train-clean-100-wav.json"}
 : ${VAL_MANIFESTS:="$DATA_DIR/librispeech-dev-clean-wav.json"}
 : ${LOG_NORM:=false}
 : ${USE_OLD_VAL:=true}
