@@ -17,7 +17,10 @@ FROM ${FROM_IMAGE_NAME}
 
 ENV PYTORCH_VERSION=1.7.0a0+7036e91 
 
+RUN apt-key adv --keyserver-options http-proxy=http://mlp-sdp-icx-1046.jf.intel.com:44333 --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/3bf863cc.pub
+
 RUN apt-get update && \
+	apt-get install -y vim \
     apt-get install -y libsndfile1 sox git cmake jq && \
     apt-get install -y --no-install-recommends numactl && \
     rm -rf /var/lib/apt/lists/*
@@ -52,5 +55,6 @@ RUN pip install --global-option="--cpp_ext" --global-option="--cuda_ext" https:/
 
 COPY requirements.txt .
 RUN pip install --no-cache --disable-pip-version-check -U -r requirements.txt
+RUN pip install ipdb
 
 COPY . .
