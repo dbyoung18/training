@@ -15,15 +15,23 @@
 ARG FROM_IMAGE_NAME=pytorch/pytorch:1.7.0-cuda11.0-cudnn8-devel
 FROM ${FROM_IMAGE_NAME}
 
+ARG http_proxy ${http_proxy}
+ARG https_proxy ${https_proxy}
+RUN echo "Acquire::http::Proxy \"${http_proxy}\";\nAcquire::https::Proxy \"${https_proxy}\";" | tee /etc/apt/apt.conf.d/80proxy
+
+ENV http_proxy ${http_proxy}
+ENV https_proxy ${https_proxy}
+
 ENV PYTORCH_VERSION=1.7.0a0+7036e91 
 
-RUN apt-key adv --keyserver-options http-proxy=http://mlp-sdp-icx-1046.jf.intel.com:44333 --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/3bf863cc.pub
+COPY ./cuda-keyring_1.0-1_all.deb cuda-keyring_1.0-1_all.deb
+RUN dpkg -i cuda-keyring_1.0-1_all.deb
 
 RUN apt-get update && \
-	apt-get install -y vim && \
+    apt-get install -y vim && \
+    apt-get install -y wget && \
     apt-get install -y libsndfile1 sox git cmake jq && \
-    apt-get install -y --no-install-recommends numactl && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends numactl
 
 RUN COMMIT_SHA=f546575109111c455354861a0567c8aa794208a2 && \
     git clone https://github.com/HawkAaron/warp-transducer deps/warp-transducer && \
@@ -49,12 +57,15 @@ RUN COMMIT_SHA=f546575109111c455354861a0567c8aa794208a2 && \
 
 WORKDIR /workspace/rnnt
 
-RUN pip install --no-cache --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda110==0.28.0
+RUN pip install --upgrade pip
+
+RUN pip install --no-cache --extra-index-url https://developer.download.nvidia.com/compute/redist --upgrade nvidia-dali-cuda110==0.28.0
 
 RUN pip install --global-option="--cpp_ext" --global-option="--cuda_ext" https://github.com/NVIDIA/apex/archive/8a1ed9e8d35dfad26fb973996319965e4224dcdd.zip
 
 COPY requirements.txt .
 RUN pip install --no-cache --disable-pip-version-check -U -r requirements.txt
 RUN pip install ipdb
+RUN pip install tensorboard-tb-profiler
 
 COPY . .
