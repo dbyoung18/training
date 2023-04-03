@@ -17,11 +17,14 @@ FROM ${FROM_IMAGE_NAME}
 
 ENV PYTORCH_VERSION=1.7.0a0+7036e91 
 
+RUN apt-key adv --keyserver-options http-proxy=http://mlp-sdp-icx-1046.jf.intel.com:44333 --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/3bf863cc.pub
+#RUN git config --global http.proxy http://proxy-prc.intel.com:913
 RUN apt-get update && \
     apt-get install -y libsndfile1 sox git cmake jq && \
     apt-get install -y --no-install-recommends numactl && \
     rm -rf /var/lib/apt/lists/*
 
+RUN git config --global http.proxy http://mlp-sdp-icx-1046.jf.intel.com:44333
 RUN COMMIT_SHA=f546575109111c455354861a0567c8aa794208a2 && \
     git clone https://github.com/HawkAaron/warp-transducer deps/warp-transducer && \
     cd deps/warp-transducer && \
@@ -46,11 +49,11 @@ RUN COMMIT_SHA=f546575109111c455354861a0567c8aa794208a2 && \
 
 WORKDIR /workspace/rnnt
 
-RUN pip install --no-cache --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda110==0.28.0
+RUN pip install --proxy=http://mlp-sdp-icx-1046.jf.intel.com:44333 --no-cache --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda110==0.28.0
 
-RUN pip install --global-option="--cpp_ext" --global-option="--cuda_ext" https://github.com/NVIDIA/apex/archive/8a1ed9e8d35dfad26fb973996319965e4224dcdd.zip
+RUN pip install --proxy=http://mlp-sdp-icx-1046.jf.intel.com:44333 --global-option="--cpp_ext" --global-option="--cuda_ext" https://github.com/NVIDIA/apex/archive/8a1ed9e8d35dfad26fb973996319965e4224dcdd.zip
 
 COPY requirements.txt .
-RUN pip install --no-cache --disable-pip-version-check -U -r requirements.txt
+RUN pip install --proxy=http://mlp-sdp-icx-1046.jf.intel.com:44333 --no-cache --disable-pip-version-check -U -r requirements.txt
 
 COPY . .

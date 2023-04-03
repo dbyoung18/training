@@ -16,16 +16,16 @@
 
 export OMP_NUM_THREADS=1
 
-: ${DATA_DIR:=${1:-"/datasets/LibriSpeech"}}
+: ${DATA_DIR:=${1:-"/datasets"}}
 : ${MODEL_CONFIG:=${2:-"configs/baseline_v3-1023sp.yaml"}}
 : ${OUTPUT_DIR:=${3:-"/results"}}
 : ${CHECKPOINT:=${4:-}}
 : ${CUDNN_BENCHMARK:=true}
-: ${NUM_GPUS:=8}
+: ${NUM_GPUS:=1}
 : ${AMP:=false}
 : ${GLOBAL_BATCH_SIZE:=1024}
 : ${VAL_BATCH_SIZE:=2}
-: ${GRAD_ACCUMULATION_STEPS:=8}
+: ${GRAD_ACCUMULATION_STEPS:=64}
 : ${LEARNING_RATE:=0.004}
 : ${LR_EXP_GAMMA:=0.935}  # ~0.005 in 80 epochs
 : ${NUM_BUCKETS=6} # empty means to use torch.utils.data.distributed.DistributedSampler
@@ -36,7 +36,7 @@ export OMP_NUM_THREADS=1
 : ${HOLD_EPOCHS:=40}
 : ${SAVE_AT_THE_END:=false}
 : ${EPOCHS_THIS_JOB:=0}
-: ${RESUME:=true}
+: ${RESUME:=false}
 : ${DALI_DEVICE:="cpu"}
 : ${VAL_FREQUENCY:=1}
 : ${PREDICTION_FREQUENCY:=1000}
